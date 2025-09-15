@@ -1,6 +1,6 @@
 function showTopBar(){
     let country = "France";
-    let vat = 200;
+    let vat = 20;
     // let vat = 200;  // This will cause test to fail
     setTimeout(() => {
         const countryBarElement = document.querySelector("section.country-bar");
