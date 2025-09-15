@@ -105,23 +105,15 @@ pipeline {
         }
         
         stage('Lint/Test') {
-            when {
-                not { 
-                    params.SKIP_TESTS 
+            steps {
+                script {
+                    if (params.SKIP_TESTS) {
+                        echo '⚠️ Tests skipped by user request'
+                        echo 'This should only be used in emergency situations!'
+                    } else {
+                        sh 'npm run test:ci'
+                    }
                 }
-            }
-            steps {
-                sh 'npm run test:ci'
-            }
-        }
-        
-        stage('Skip Tests') {
-            when {
-                params.SKIP_TESTS
-            }
-            steps {
-                echo '⚠️ Tests skipped by user request'
-                echo 'This should only be used in emergency situations!'
             }
         }
         
