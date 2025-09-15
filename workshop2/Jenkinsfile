@@ -106,7 +106,9 @@ pipeline {
         
         stage('Lint/Test') {
             when {
-                not { params.SKIP_TESTS }
+                not { 
+                    params.SKIP_TESTS 
+                }
             }
             steps {
                 sh 'npm run test:ci'
