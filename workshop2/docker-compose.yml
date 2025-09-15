@@ -1,0 +1,28 @@
+services:
+  jenkins:
+    image: jenkins/jenkins:lts
+    container_name: jenkins
+    user: root
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false
+    # Jenkins will start normally and we'll configure admin user later
+
+  jenkins-agent:
+    build: .
+    container_name: jenkins-agent
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - JENKINS_URL=http://jenkins:8080
+    depends_on:
+      - jenkins
+
+volumes:
+  jenkins_home:

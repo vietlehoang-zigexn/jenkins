@@ -1,0 +1,357 @@
+pipeline {
+    agent {
+        docker {
+            image 'jenkins-agent-optimized'
+            args '-u root:root -v /home/vietlh/code/workshop2:/workspace/ssh-keys:ro'
+        }
+    }
+    
+    // Auto run configuration - Complete CI/CD flow
+    triggers {
+        githubPush()
+        pollSCM('H/2 * * * *')  // More frequent polling for better responsiveness
+    }
+    
+    // Auto-run for all branches with different strategies
+    options {
+        // Keep only last 10 builds to save disk space
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // Timeout after 30 minutes
+        timeout(time: 30, unit: 'MINUTES')
+        // Retry failed builds once
+        retry(1)
+    }
+    
+    parameters {
+        choice(
+            name: 'DEPLOY_ENVIRONMENT',
+            choices: ['auto', 'local-only', 'local+remote', 'local+firebase-token', 'local+firebase-adc', 'all'],
+            description: 'Chọn môi trường deploy (auto = tự động theo branch)'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Bỏ qua bước test (chỉ dùng khi cần thiết)'
+        )
+        string(
+            name: 'CUSTOM_MESSAGE',
+            defaultValue: '',
+            description: 'Tin nhắn tùy chỉnh cho Slack (để trống sẽ dùng mặc định)'
+        )
+    }
+    
+    environment {
+        // Credentials managed via Jenkins GUI
+        FIREBASE_TOKEN = credentials('firebase-token')
+        SSH_PRIVATE_KEY = credentials('ssh-private-key')
+        GOOGLE_APPLICATION_CREDENTIALS = credentials('google-application-credentials')
+        
+        // Environment variables managed via Jenkins GUI
+        FIREBASE_PROJECT = credentials('firebase-project-id')
+        REMOTE_HOST = credentials('remote-host')
+        REMOTE_USER = credentials('remote-user')
+        REMOTE_PORT = credentials('remote-port')
+        SLACK_CHANNEL = credentials('slack-channel')
+        DEPLOY_USER = credentials('deploy-user')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.BUILD_DATE = sh(
+                        script: 'date +%Y%m%d',
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Auto-determine deploy environment based on branch
+                    def branch = env.BRANCH_NAME ?: env.GIT_BRANCH ?: 'unknown'
+                    def deployEnv = params.DEPLOY_ENVIRONMENT
+                    
+                    if (deployEnv == 'auto') {
+                        if (branch.contains('develop')) {
+                            env.DEPLOY_ENVIRONMENT = 'local-only'
+                            env.BRANCH_TYPE = 'develop'
+                        } else if (branch.contains('main') || branch.contains('master')) {
+                            env.DEPLOY_ENVIRONMENT = 'all'
+                            env.BRANCH_TYPE = 'main'
+                        } else {
+                            env.DEPLOY_ENVIRONMENT = 'local-only'
+                            env.BRANCH_TYPE = 'other'
+                        }
+                    } else {
+                        env.DEPLOY_ENVIRONMENT = deployEnv
+                        env.BRANCH_TYPE = 'manual'
+                    }
+                    
+                    echo "🌿 Branch: ${branch}"
+                    echo "🚀 Deploy Environment: ${env.DEPLOY_ENVIRONMENT}"
+                    echo "📦 Branch Type: ${env.BRANCH_TYPE}"
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh '''
+                    echo "All dependencies already pre-installed in custom image!"
+                    echo "SSH client: $(which ssh)"
+                    echo "Firebase CLI: $(which firebase)"
+                    echo "Node.js: $(node --version)"
+                    echo "npm: $(npm --version)"
+                '''
+            }
+        }
+        
+        stage('Lint/Test') {
+            when {
+                not { params.SKIP_TESTS }
+            }
+            steps {
+                sh 'npm run test:ci'
+            }
+        }
+        
+        stage('Skip Tests') {
+            when {
+                params.SKIP_TESTS
+            }
+            steps {
+                echo '⚠️ Tests skipped by user request'
+                echo 'This should only be used in emergency situations!'
+            }
+        }
+        
+        stage('Deploy to Local') {
+            steps {
+                script {
+                    // Create deployment directory structure
+                    sh '''
+                        mkdir -p /tmp/deploy/${BUILD_DATE}
+                        mkdir -p /tmp/deploy/current
+                        
+                        # Copy necessary files only
+                        cp index.html /tmp/deploy/${BUILD_DATE}/
+                        cp 404.html /tmp/deploy/${BUILD_DATE}/
+                        cp -r css /tmp/deploy/${BUILD_DATE}/
+                        cp -r js /tmp/deploy/${BUILD_DATE}/
+                        cp -r images /tmp/deploy/${BUILD_DATE}/
+                        
+                        # Create symlink
+                        rm -rf /tmp/deploy/current
+                        ln -s /tmp/deploy/${BUILD_DATE} /tmp/deploy/current
+                        
+                        # Keep only 5 recent deployments
+                        cd /tmp/deploy
+                        ls -t | tail -n +6 | xargs -r rm -rf
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to Remote') {
+            when {
+                anyOf {
+                    expression { 
+                        return env.DEPLOY_ENVIRONMENT == 'local+remote' || 
+                               env.DEPLOY_ENVIRONMENT == 'all'
+                    }
+                    allOf {
+                        expression { 
+                            return env.SSH_PRIVATE_KEY != null && env.SSH_PRIVATE_KEY != '' 
+                        }
+                        expression {
+                            return env.DEPLOY_ENVIRONMENT == 'auto' && env.BRANCH_TYPE == 'main'
+                        }
+                    }
+                }
+            }
+            steps {
+                script {
+                    // Try to copy SSH key from host, fallback to Jenkins credential
+                    sh '''
+                        # Try to copy SSH key from host first
+                        if [ -f /workspace/ssh-keys/newbie_id_rsa ]; then
+                            echo "Copying SSH key from host..."
+                            cp /workspace/ssh-keys/newbie_id_rsa /tmp/ssh_key
+                        else
+                            echo "Host SSH key not found, using Jenkins credential..."
+                            printf '%s\n' "${SSH_PRIVATE_KEY}" > /tmp/ssh_key
+                        fi
+                        
+                        chmod 600 /tmp/ssh_key
+                        echo "=== SSH Key File Debug ==="
+                        echo "File size: $(wc -c < /tmp/ssh_key)"
+                        echo "Line count: $(wc -l < /tmp/ssh_key)"
+                        echo "First line: $(head -1 /tmp/ssh_key)"
+                        echo "Last line: $(tail -1 /tmp/ssh_key)"
+                        echo "========================="
+                    '''
+                    
+                    // Deploy to remote server
+                    sh '''
+                        # Create remote directory structure
+                        ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -p ${REMOTE_PORT} ${REMOTE_USER}@${REMOTE_HOST} "
+                            mkdir -p /usr/share/nginx/html/jenkins/vietlh/workshop2
+                            mkdir -p /usr/share/nginx/html/jenkins/vietlh/deploy/${BUILD_DATE}
+                            mkdir -p /usr/share/nginx/html/jenkins/vietlh/deploy/current
+                        "
+                        
+                        # Copy files to remote
+                        scp -i /tmp/ssh_key -o StrictHostKeyChecking=no -P ${REMOTE_PORT} index.html ${REMOTE_USER}@${REMOTE_HOST}:/usr/share/nginx/html/jenkins/vietlh/workshop2/
+                        scp -i /tmp/ssh_key -o StrictHostKeyChecking=no -P ${REMOTE_PORT} 404.html ${REMOTE_USER}@${REMOTE_HOST}:/usr/share/nginx/html/jenkins/vietlh/workshop2/
+                        scp -i /tmp/ssh_key -o StrictHostKeyChecking=no -P ${REMOTE_PORT} -r css ${REMOTE_USER}@${REMOTE_HOST}:/usr/share/nginx/html/jenkins/vietlh/workshop2/
+                        scp -i /tmp/ssh_key -o StrictHostKeyChecking=no -P ${REMOTE_PORT} -r js ${REMOTE_USER}@${REMOTE_HOST}:/usr/share/nginx/html/jenkins/vietlh/workshop2/
+                        scp -i /tmp/ssh_key -o StrictHostKeyChecking=no -P ${REMOTE_PORT} -r images ${REMOTE_USER}@${REMOTE_HOST}:/usr/share/nginx/html/jenkins/vietlh/workshop2/
+                        
+                        # Copy to deploy folder
+                        ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -p ${REMOTE_PORT} ${REMOTE_USER}@${REMOTE_HOST} "
+                            cp -r /usr/share/nginx/html/jenkins/vietlh/workshop2/* /usr/share/nginx/html/jenkins/vietlh/deploy/${BUILD_DATE}/
+                            
+                            # Create symlink
+                            rm -rf /usr/share/nginx/html/jenkins/vietlh/deploy/current
+                            ln -s /usr/share/nginx/html/jenkins/vietlh/deploy/${BUILD_DATE} /usr/share/nginx/html/jenkins/vietlh/deploy/current
+                            
+                            # Keep only 5 recent deployments
+                            cd /usr/share/nginx/html/jenkins/vietlh/deploy
+                            ls -t | tail -n +6 | xargs -r rm -rf
+                        "
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to Remote (Skip)') {
+            steps {
+                echo 'SSH_PRIVATE_KEY credential not configured. Skipping remote deployment.'
+                echo 'To enable remote deployment, add SSH_PRIVATE_KEY credential in Jenkins.'
+            }
+        }
+        
+        stage('Deploy to Firebase (Token)') {
+            when {
+                anyOf {
+                    expression { 
+                        return env.DEPLOY_ENVIRONMENT == 'local+firebase-token' || 
+                               env.DEPLOY_ENVIRONMENT == 'all'
+                    }
+                    allOf {
+                        expression { 
+                            return env.FIREBASE_TOKEN != null && env.FIREBASE_TOKEN != '' 
+                        }
+                        expression {
+                            return env.DEPLOY_ENVIRONMENT == 'auto' && env.BRANCH_TYPE == 'main'
+                        }
+                    }
+                }
+            }
+            steps {
+                sh '''
+                    echo "=== Firebase Token Debug ==="
+                    if [ -n "$FIREBASE_TOKEN" ]; then
+                        echo "FIREBASE_TOKEN configured: true"
+                        echo "FIREBASE_TOKEN length: ${#FIREBASE_TOKEN}"
+                    else
+                        echo "FIREBASE_TOKEN configured: false"
+                        echo "FIREBASE_TOKEN length: 0"
+                    fi
+                    echo "FIREBASE_PROJECT: $FIREBASE_PROJECT"
+                    echo "============================="
+                    
+                    if [ -n "$FIREBASE_TOKEN" ]; then
+                        echo "Deploying to Firebase with token..."
+                        firebase deploy --token "$FIREBASE_TOKEN" --only hosting --project="$FIREBASE_PROJECT"
+                    else
+                        echo "FIREBASE_TOKEN not configured, skipping Firebase deployment"
+                    fi
+                '''
+            }
+        }
+        
+        stage('Deploy to Firebase (Skip)') {
+            steps {
+                echo 'Firebase credentials not configured. Skipping Firebase deployment.'
+                echo 'To enable Firebase deployment, add FIREBASE_TOKEN or GOOGLE_APPLICATION_CREDENTIALS in Jenkins.'
+            }
+        }
+        
+        stage('Deploy to Firebase (ADC)') {
+            when {
+                anyOf {
+                    expression { 
+                        return env.DEPLOY_ENVIRONMENT == 'local+firebase-adc' || 
+                               env.DEPLOY_ENVIRONMENT == 'all'
+                    }
+                    allOf {
+                        expression { 
+                            return env.GOOGLE_APPLICATION_CREDENTIALS != null && env.GOOGLE_APPLICATION_CREDENTIALS != '' 
+                        }
+                        expression {
+                            return env.DEPLOY_ENVIRONMENT == 'auto' && env.BRANCH_TYPE == 'main'
+                        }
+                    }
+                }
+            }
+            steps {
+                sh '''
+                    echo "=== Firebase ADC Debug ==="
+                    if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+                        echo "GOOGLE_APPLICATION_CREDENTIALS: configured"
+                        echo "Credentials file: $GOOGLE_APPLICATION_CREDENTIALS"
+                        echo "File exists: $([ -f "$GOOGLE_APPLICATION_CREDENTIALS" ] && echo 'yes' || echo 'no')"
+                    else
+                        echo "GOOGLE_APPLICATION_CREDENTIALS: not configured"
+                    fi
+                    echo "FIREBASE_PROJECT: $FIREBASE_PROJECT"
+                    echo "==========================="
+                    
+                    # Deploy using ADC (if credentials file exists)
+                    if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ] && [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+                        echo "Deploying to Firebase with ADC..."
+                        firebase deploy --only hosting --project="$FIREBASE_PROJECT"
+                    else
+                        echo "ADC credentials not found, skipping ADC deployment"
+                    fi
+                '''
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                def deployUser = env.DEPLOY_USER ?: "vietlh"
+                def message = params.CUSTOM_MESSAGE ?: "✅ ${deployUser} deploy job ${env.JOB_NAME} #${env.BUILD_NUMBER} thành công! 🚀"
+                def deployEnv = env.DEPLOY_ENVIRONMENT ?: "local-only"
+                def branchType = env.BRANCH_TYPE ?: "unknown"
+                def finalMessage = "${message}\n🌿 Branch: ${branchType}\n📦 Environment: ${deployEnv}\n👤 Deployer: ${deployUser}\n🔗 Build: ${env.BUILD_URL}"
+                
+                slackSend (
+                    channel: "${SLACK_CHANNEL}",
+                    color: 'good',
+                    message: finalMessage
+                )
+            }
+        }
+        failure {
+            script {
+                def deployUser = env.DEPLOY_USER ?: "vietlh"
+                def message = params.CUSTOM_MESSAGE ?: "❌ ${deployUser} deploy job ${env.JOB_NAME} #${env.BUILD_NUMBER} thất bại! 💥"
+                def deployEnv = env.DEPLOY_ENVIRONMENT ?: "local-only"
+                def branchType = env.BRANCH_TYPE ?: "unknown"
+                def finalMessage = "${message}\n🌿 Branch: ${branchType}\n📦 Environment: ${deployEnv}\n👤 Deployer: ${deployUser}\n🔗 Build: ${env.BUILD_URL}"
+                
+                slackSend (
+                    channel: "${SLACK_CHANNEL}",
+                    color: 'danger',
+                    message: finalMessage
+                )
+            }
+        }
+        always {
+            // Cleanup
+            sh 'rm -rf /tmp/ssh_key'
+        }
+    }
+}
